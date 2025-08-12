@@ -1,202 +1,209 @@
-import os, time, hmac, hashlib, asyncio, re, requests
+import os, re, time, json, asyncio, requests
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils import executor
 
-# ========= ENV =========
-TG_TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("TG_TOKEN") or "").strip()
+# ========= ENV (из Railway Variables) =========
+TG_TOKEN   = (os.getenv("TELEGRAM_TOKEN") or os.getenv("TG_TOKEN") or "").strip()
 ALLOWED_ID = int(os.getenv("ALLOWED_USER_ID", "0"))
-PAPER = os.getenv("PAPER_MODE", "true").lower() == "true"
+PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
 
-# Сканер
-WATCHLIST = [s.strip().upper() for s in os.getenv(
+# Часовой пояс и время автодайджестов (строго по твоему TZ)
+TZ          = os.getenv("TZ", "Asia/Ho_Chi_Minh")
+NEWS_TIMES  = [t.strip() for t in os.getenv("NEWS_TIMES", "09:00,19:00,21:00,23:00").split(",") if t.strip()]
+
+# Сканер (watchlist и интервал проверки в секундах)
+WATCHLIST     = [s.strip().upper() for s in os.getenv(
     "WATCHLIST",
     "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,AVAXUSDT,INJUSDT,OPUSDT,NEARUSDT,LINKUSDT,MATICUSDT,SEIUSDT"
 ).split(",") if s.strip()]
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))   # сек (например 300 = 5 мин)
-TP1_PCT = float(os.getenv("TP1_PCT", "3.0"))             # +% к цене покупки
-TP2_PCT = float(os.getenv("TP2_PCT", "6.0"))             # +%
-SL_PCT  = float(os.getenv("SL_PCT",  "2.0"))             # -%
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))  # 300сек = 5мин по умолчанию
 
-# ====== Внутреннее «псевдо-портфолио» (ручной учёт) ======
-# /hold add SOL 10 @ 55   — добавить позицию
-# /hold rm  SOL 3         — уменьшить кол-во (фиксировать)
-# /hold report            — отчёт
-HOLD = {}  # {"SOLUSDT": {"qty": 10.0, "avg": 55.0}}
+# Цели/стопы в процентах (для советов и сигналов)
+TP1_PCT = float(os.getenv("TP1_PCT", "3.0"))   # +3%
+TP2_PCT = float(os.getenv("TP2_PCT", "6.0"))   # +6%
+SL_PCT  = float(os.getenv("SL_PCT",  "2.0"))   # -2%
+
+# Применим TZ к процессу (на Linux)
+try:
+    os.environ["TZ"] = TZ
+    time.tzset()
+except Exception:
+    pass
 
 # ========= Checks =========
 if not TG_TOKEN or ":" not in TG_TOKEN:
-    raise RuntimeError(f"Bad TELEGRAM_TOKEN: len={len(TG_TOKEN)}")
+    raise RuntimeError("Bad TELEGRAM_TOKEN")
 
+# ========= Bot =========
 bot = Bot(token=TG_TOKEN, parse_mode="HTML")
 dp  = Dispatcher(bot)
 
+# ========= Локальный «бумажный» учёт позиций =========
+# Пример команд:
+# /hold add SOL 10 @ 55
+# /hold rm  SOL 3
+# /hold report
+HOLD = {}  # {"SOLUSDT": {"qty": 10.0, "avg": 55.0}}
+
 # ========= Helpers =========
 def ensure(m: types.Message) -> bool:
-    return ALLOWED_ID == 0 or m.from_user.id == ALLOWED_ID
+    return (ALLOWED_ID == 0) or (m.from_user.id == ALLOWED_ID)
+
+def http_get(url, params=None, timeout=10):
+    try:
+        return requests.get(url, params=params, timeout=timeout, headers={"User-Agent":"Mozilla/5.0"})
+    except Exception:
+        return None
 
 def binance_price(symbol: str):
-    try:
-        r = requests.get(f"https://api.binance.com/api/v3/ticker/price",
-                         params={"symbol": symbol}, timeout=10)
-        if r.status_code == 200:
-            return float(r.json()["price"])
-    except Exception:
-        pass
+    r = http_get("https://api.binance.com/api/v3/ticker/price", {"symbol": symbol})
+    if r and r.status_code == 200:
+        try: return float(r.json()["price"])
+        except: return None
     return None
 
-def fmt_pct(x): 
-    s = f"{x:.1f}%"
-    return s.replace(".0%","%")
+def binance_24h(symbol: str):
+    r = http_get("https://api.binance.com/api/v3/ticker/24hr", {"symbol": symbol})
+    if r and r.status_code == 200:
+        try: return float(r.json().get("priceChangePercent", 0.0))
+        except: return 0.0
+    return 0.0
 
-def short_reason(side:str):
-    return "объём растёт, пробой сопротивления" if side=="BUY" else "слабый импульс/риски снижения"
+def fmt_pct(x):
+    try: return f"{x:+.1f}%"
+    except: return "+0%"
 
-# ====== Команды ======
+# ========= Новости (коротко) =========
+FEEDS = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://www.investing.com/rss/market_overview.rss",
+]
+def fetch_news(limit=4):
+    import re
+    items=[]
+    for u in FEEDS:
+        r=http_get(u, timeout=12)
+        if not r or r.status_code!=200: continue
+        titles=re.findall(r"<title>(.*?)</title>", r.text, re.I|re.S)
+        for t in titles[1:12]:
+            t=re.sub("<.*?>","",t).strip()
+            if t and t not in items:
+                items.append(t)
+            if len(items)>=limit: break
+        if len(items)>=limit: break
+    return items
+
+# ========= Команды =========
 @dp.message_handler(commands=["start","help"])
-async def start(m: types.Message):
-    if not ensure(m): return
-    text = (
+async def cmd_start(m: types.Message):
+    if not ensure(m): return await m.answer("⛔️ Нет доступа.")
+    await m.answer(
         "🤖 Я готов.\n"
         "Команды:\n"
-        "• /status — статус сканера 🔧\n"
-        "• /advice — быстрый совет по портфелю 💡\n"
+        "• /status — статус сканера\n"
+        "• /advice — совет по текущим позициям\n"
         "• /hold add SOL 10 @ 55 — добавить позицию\n"
         "• /hold rm SOL 3 — списать (продажа)\n"
         "• /hold report — отчёт по портфелю\n"
-        "• /news — новости (кратко)\n\n"
-        f"PAPER_MODE={'ON' if PAPER else 'OFF'}"
+        "• /news — краткие новости\n"
+        f"\nPAPER_MODE={'ON' if PAPER_MODE else 'OFF'} • TZ={TZ}\n"
+        f"Дайджесты: {', '.join(NEWS_TIMES)}"
     )
-    await m.answer(text)
 
 @dp.message_handler(commands=["status"])
-async def status(m: types.Message):
+async def cmd_status(m: types.Message):
     if not ensure(m): return
-    wl = ",".join(WATCHLIST)
-    text = (
-        "🛠️ <b>Статус сканера</b>\n"
-        f"Watchlist: {wl}\n"
+    await m.answer(
+        "🛠️ <b>Статус</b>\n"
+        f"Watchlist: {', '.join(WATCHLIST)}\n"
         f"Интервал: каждые {SCAN_INTERVAL//60} мин\n"
-        f"Цели: TP1={fmt_pct(TP1_PCT)}, TP2={fmt_pct(TP2_PCT)}, SL=-{fmt_pct(SL_PCT)}"
+        f"Цели: TP1={TP1_PCT:.1f}%  TP2={TP2_PCT:.1f}%  SL={-SL_PCT:.1f}%\n"
+        f"PAPER_MODE: {'ON' if PAPER_MODE else 'OFF'}"
     )
-    await m.answer(text)
 
-# ---- Псевдо‑портфолио ----
+@dp.message_handler(commands=["news"])
+async def cmd_news(m: types.Message):
+    if not ensure(m): return
+    items = fetch_news(4)
+    if not items: return await m.answer("⚠️ Новости недоступны.")
+    await m.answer("📰 <b>Новости</b>\n" + "\n".join([f"• {t}" for t in items]))
+
+# ========= Учёт /hold =========
 POS_RE = re.compile(r"^/hold\s+(add|rm)\s+([A-Za-z]{2,10})\s+(\d+(?:\.\d+)?)\s*(?:@\s*(\d+(?:\.\d+)?))?$")
 
 @dp.message_handler(commands=["hold"])
-async def hold_cmd(m: types.Message):
+async def cmd_hold(m: types.Message):
     if not ensure(m): return
     t = m.text.strip()
     if t == "/hold" or t.endswith("report"):
-        return await hold_report(m)
+        return await m.answer("📒 <b>Портфель</b>\n" + build_portfolio_report())
 
     mt = POS_RE.match(t)
     if not mt:
         return await m.answer("Формат:\n/hold add SOL 10 @ 55\n/hold rm SOL 3\n/hold report")
+
     action, sym, qty, px = mt.groups()
-    sym = sym.upper()
+    sym = sym.upper(); 
     if not sym.endswith("USDT"): sym += "USDT"
     qty = float(qty)
-    if action == "add":
-        if not px:
-            live = binance_price(sym)
-            if live is None: return await m.answer("Не смог получить цену.")
-            px = live
-        else:
-            px = float(px)
+
+    if action.lower()=="add":
+        price = float(px) if px else (binance_price(sym) or 0.0)
         pos = HOLD.setdefault(sym, {"qty":0.0, "avg":0.0})
         new_qty = pos["qty"] + qty
-        pos["avg"] = (pos["avg"]*pos["qty"] + px*qty)/new_qty if new_qty>0 else 0.0
+        pos["avg"] = (pos["avg"]*pos["qty"] + price*qty)/new_qty if new_qty>0 else 0.0
         pos["qty"] = new_qty
-        await m.answer(f"➕ Добавлено: <b>{sym}</b> {qty} @ {px}\nТекущая позиция: {pos}")
-    else:
-        pos = HOLD.get(sym)
-        if not pos or pos["qty"]<=0:
-            return await m.answer("Позиция не найдена.")
-        sell_qty = min(qty, pos["qty"])
-        pos["qty"] -= sell_qty
-        await m.answer(f"➖ Списано: <b>{sym}</b> {sell_qty}\nТекущая позиция: {pos}")
+        return await m.answer(f"➕ Добавлено: <b>{sym}</b> {qty} @ {price}\nТекущая позиция: {pos}")
 
-@dp.message_handler(commands=["advice"])
-async def advice(m: types.Message):
-    if not ensure(m): return
+    # rm
+    pos = HOLD.get(sym)
+    if not pos or pos["qty"]<=0:
+        return await m.answer("Позиция не найдена.")
+    sell_qty = min(qty, pos["qty"])
+    pos["qty"] -= sell_qty
+    if pos["qty"]<=0: HOLD.pop(sym, None)
+    return await m.answer(f"➖ Списано: <b>{sym}</b> {sell_qty}\nОстаток: {pos['qty'] if sym in HOLD else 0.0}")
+
+def build_portfolio_report():
     if not HOLD:
-        return await m.answer("Пока позиций нет. Добавь: /hold add SOL 10 @ 55")
+        return "Портфель пуст. Пример: /hold add SOL 10 @ 55"
+    lines=[]; total=0.0
+    for sym, pos in HOLD.items():
+        px = binance_price(sym) or 0.0
+        pnl = (px/pos["avg"]-1)*100 if pos["avg"]>0 else 0.0
+        val = px*pos["qty"]; total+=val
+        lines.append(f"• {sym}: {pos['qty']:.4f} @ {pos['avg']:.4f} → {px:.4f} ({fmt_pct(pnl)}) ≈ <b>{val:.2f} USDT</b>")
+    lines.append(f"\nИтого ≈ <b>{total:.2f} USDT</b>")
+    return "\n".join(lines)
+
+# ========= Советы по текущим позициям =========
+def build_advice_text():
+    if not HOLD:
+        return "Пока позиций нет. Добавь: /hold add SOL 10 @ 55"
     lines = ["💡 <b>Совет по портфелю</b>"]
     for sym, pos in HOLD.items():
-        live = binance_price(sym)
-        if live is None: 
-            lines.append(f"• {sym}: цена недоступна")
-            continue
-        change = (live/pos["avg"]-1)*100 if pos["avg"]>0 else 0
+        px = binance_price(sym)
+        if px is None:
+            lines.append(f"• {sym}: цена недоступна"); continue
+        change = (px/pos["avg"]-1)*100 if pos["avg"]>0 else 0.0
         if change >= TP2_PCT:
-            lines.append(f"• {sym}: {live:.4f} — ✅ TP2: зафиксируй 80% (прибыль {change:.1f}%). Причина: сильный тренд, {short_reason('SELL')}.")
+            lines.append(f"• {sym}: {px:.4f} — ✅ TP2: зафиксируй 80% (прибыль {change:.1f}%). ℹ️ Сильный импульс — снижаем риск.")
         elif change >= TP1_PCT:
-            lines.append(f"• {sym}: {live:.4f} — ✅ TP1: зафиксируй 50% (прибыль {change:.1f}%). Причина: достижение первой цели.")
+            lines.append(f"• {sym}: {px:.4f} — ✅ TP1: зафиксируй 50% (прибыль {change:.1f}%). ℹ️ Достигнута первая цель.")
         elif change <= -SL_PCT:
-            lines.append(f"• {sym}: {live:.4f} — 🛑 SL: продай всё (убыток {change:.1f}%). Причина: защита капитала.")
+            lines.append(f"• {sym}: {px:.4f} — 🛑 SL: закрой позицию (убыток {change:.1f}%). ℹ️ Защита капитала.")
         else:
-            lines.append(f"• {sym}: {live:.4f} — ⏳ Держать. Δ={change:.1f}%")
+            lines.append(f"• {sym}: {px:.4f} — ⏳ Держать. Δ={change:.1f}%. ℹ️ Сигналов на фиксацию нет.")
+    return "\n".join(lines)
 
-    await m.answer("\n".join(lines))
-
-@dp.message_handler(commands=["news"])
-async def news(m: types.Message):
+@dp.message_handler(commands=["advice"])
+async def cmd_advice(m: types.Message):
     if not ensure(m): return
-    try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=8)
-        btc = float(r.json().get("price", 0))
-        r2 = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT", timeout=8)
-        eth = float(r2.json().get("price", 0))
-        await m.answer(f"📰 <b>Коротко</b>\nBTC: <code>{btc}</code>\nETH: <code>{eth}</code>")
-    except Exception:
-        await m.answer("Новости/цены сейчас недоступны.")
+    await m.answer(build_advice_text())
 
-# ========= Автосканер сигналов =========
-async def scanner_loop():
-    await bot.wait_until_ready() if hasattr(bot, "wait_until_ready") else asyncio.sleep(0)
-    # Храним «последний совет» чтобы не спамить
-    last_state = {}  # sym -> state: 'TP2','TP1','SL','HOLD'
-    while True:
-        try:
-            for sym in WATCHLIST:
-                live = binance_price(sym)
-                if live is None: continue
-                # Если есть позиция — совет по ней; если нет — просто мониторинг пробоя
-                pos = HOLD.get(sym)
-                state = "HOLD"
-                explain = ""
-                kb=None
-                if pos and pos["qty"]>0 and pos["avg"]>0:
-                    change = (live/pos["avg"]-1)*100
-                    if change >= TP2_PCT:
-                        state="TP2"; explain=f"🎯 {sym}: цена {live:.4f}. TP2 {fmt_pct(TP2_PCT)} достигнут — зафиксируй 80%. Причина: сильный импульс."
-                        kb = InlineKeyboardMarkup().add(
-                            InlineKeyboardButton("✅ Зафиксировать 80%", callback_data=f"fix|{sym}|0.8"))
-                    elif change >= TP1_PCT:
-                        state="TP1"; explain=f"🎯 {sym}: цена {live:.4f}. TP1 {fmt_pct(TP1_PCT)} — зафиксируй 50%."
-                        kb = InlineKeyboardMarkup().add(
-                            InlineKeyboardButton("✅ Зафиксировать 50%", callback_data=f"fix|{sym}|0.5"))
-                    elif change <= -SL_PCT:
-                        state="SL"; explain=f"🛑 {sym}: цена {live:.4f}. Стоп {fmt_pct(SL_PCT)} — продай всё для защиты."
-                        kb = InlineKeyboardMarkup().add(
-                            InlineKeyboardButton("❗ Продать всё", callback_data=f"fix|{sym}|1.0"))
-                    else:
-                        state="HOLD"
-
-                # шлём только при смене состояния
-                if state != last_state.get(sym) and state != "HOLD" and ALLOWED_ID:
-                    try:
-                        await bot.send_message(ALLOWED_ID, explain, reply_markup=kb)
-                    except Exception:
-                        pass
-                    last_state[sym]=state
-            await asyncio.sleep(SCAN_INTERVAL)
-        except Exception:
-            await asyncio.sleep(SCAN_INTERVAL)
-
+# ========= Кнопки фиксации по сигналу сканера =========
 @dp.callback_query_handler(lambda c: c.data.startswith("fix|"))
 async def on_fix(c: types.CallbackQuery):
     if ALLOWED_ID and c.from_user.id != ALLOWED_ID:
@@ -208,13 +215,85 @@ async def on_fix(c: types.CallbackQuery):
         return await c.message.answer("Позиция не найдена.")
     sell_qty = round(pos["qty"]*frac, 6)
     pos["qty"] -= sell_qty
+    if pos["qty"]<=0: HOLD.pop(sym, None)
     await c.message.edit_reply_markup()
-    await c.message.answer(f"💰 Зафиксировано: {sym} {sell_qty}\nОстаток: {pos['qty']}")
+    await c.message.answer(f"💰 Зафиксировано: {sym} {sell_qty}\nОстаток: {pos.get('qty', 0.0)}")
 
+# ========= Фон: сканер (TP1/TP2/SL) каждые N секунд =========
+async def scanner_loop():
+    last_state = {}  # sym -> {'state':'TP1/TP2/SL/HOLD', 'ts': ...}
+    while True:
+        try:
+            for sym, pos in list(HOLD.items()):
+                if pos["qty"]<=0 or pos["avg"]<=0: continue
+                px = binance_price(sym); 
+                if px is None: continue
+                change = (px/pos["avg"]-1)*100
+                state="HOLD"; text=None; kb=None
+                if change >= TP2_PCT:
+                    state="TP2"
+                    text = f"🎯 {sym}: {px:.4f}. Достигнут TP2 {TP2_PCT:.1f}% — зафиксируй 80%."
+                    kb = InlineKeyboardMarkup().add(
+                        InlineKeyboardButton("✅ Зафиксировать 80%", callback_data=f"fix|{sym}|0.8"))
+                elif change >= TP1_PCT:
+                    state="TP1"
+                    text = f"🎯 {sym}: {px:.4f}. Достигнут TP1 {TP1_PCT:.1f}% — зафиксируй 50%."
+                    kb = InlineKeyboardMarkup().add(
+                        InlineKeyboardButton("✅ Зафиксировать 50%", callback_data=f"fix|{sym}|0.5"))
+                elif change <= -SL_PCT:
+                    state="SL"
+                    text = f"🛑 {sym}: {px:.4f}. Стоп {SL_PCT:.1f}% — продай всё для защиты."
+                    kb = InlineKeyboardMarkup().add(
+                        InlineKeyboardButton("❗ Продать всё", callback_data=f"fix|{sym}|1.0"))
+                # отправляем только при смене состояния
+                prev = last_state.get(sym, {}).get("state")
+                if text and state != prev and ALLOWED_ID:
+                    try:
+                        await bot.send_message(ALLOWED_ID, text, reply_markup=kb)
+                    except Exception:
+                        pass
+                    last_state[sym] = {"state": state, "ts": time.time()}
+            await asyncio.sleep(max(15, SCAN_INTERVAL))
+        except Exception:
+            await asyncio.sleep(max(15, SCAN_INTERVAL))
+
+# ========= Фон: автодайджесты в заданные часы =========
+async def daily_brief_loop():
+    sent_today = set()  # "HH:MM"
+    current_date = datetime.now().date()
+    while True:
+        try:
+            now = datetime.now()
+            if now.date() != current_date:
+                sent_today.clear()
+                current_date = now.date()
+            hhmm = now.strftime("%H:%M")
+            if ALLOWED_ID and hhmm in NEWS_TIMES and hhmm not in sent_today:
+                btc = binance_price("BTCUSDT"); eth = binance_price("ETHUSDT")
+                lines = [
+                    f"🗓️ Дайджест {now.strftime('%d.%m %H:%M')} ({TZ})",
+                    f"📊 BTC: <code>{btc}</code> • ETH: <code>{eth}</code>",
+                    "📰 Новости:",
+                ]
+                news = fetch_news(3)
+                lines += [f"• {t}" for t in news] if news else ["• (новости недоступны)"]
+                lines.append("")
+                lines.append(build_advice_text())
+                lines.append("\n➡️ Для детального совета: /advice")
+                try:
+                    await bot.send_message(ALLOWED_ID, "\n".join(lines))
+                except Exception:
+                    pass
+                sent_today.add(hhmm)
+            await asyncio.sleep(20)
+        except Exception:
+            await asyncio.sleep(20)
+
+# ========= Запуск =========
 async def on_startup(_):
-    # запускаем фоновый сканер
+    # запускаем 2 фоновые задачи
     asyncio.create_task(scanner_loop())
+    asyncio.create_task(daily_brief_loop())
 
-# ====== Entry ======
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
