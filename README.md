@@ -1,21 +1,25 @@
-# Ilgis MEXC Trader Bot (Telegram, Railway-ready)
+Ilgis MEXC Trader Bot (Telegram, Railway)
 
-Функции:
-- Команды: /start, /balance, /news, /market, /signal (шаблон), /help
-- Утро/вечер авто-дайджест: новости + тренд BTC/ETH (SMA20/50)
-- Сигнал с подтверждением ✅ Да / ❌ Нет
-- По подтверждению — реальная покупка/продажа на MEXC (если PAPER_MODE=false)
-- Автоустановка TP (limit) и SL (stop-loss) после покупки
+Команды:
+• /start, /help
+• /news — новости
+• /market — цены BTC/ETH
+• /balance — баланс MEXC
+• /signal BUY SOL 25 @MKT TP=212 SL=188
+  R: краткая причина
+  -> Подтверждение кнопками ✅/❌ (после "Да" создаются ордер + TP + SL)
 
-Переменные окружения в Railway → Variables:
-- TELEGRAM_TOKEN — токен бота от @BotFather
-- ALLOWED_USER_ID — твой Telegram ID (чтобы только ты управлял)
-- MEXC_API_KEY — API Key на MEXC (только Trade, без Withdraw)
-- MEXC_SECRET_KEY — Secret Key MEXC
-- PAPER_MODE — true/false (бумажный режим по умолчанию true)
-- MAX_ORDER_USDT — лимит на одну сделку, например 300
-- TZ — часовой пояс, например Asia/Almaty или Asia/Ho_Chi_Minh
+Переменные окружения (Railway -> Variables):
+TELEGRAM_TOKEN  — токен из @BotFather
+ALLOWED_USER_ID — ваш Telegram ID (число) (можно 0, чтобы тестить без ограничения)
+MEXC_API_KEY    — API Key MEXC
+MEXC_SECRET_KEY — Secret Key MEXC
+PAPER_MODE      — true/false (бумажный режим)
+MAX_ORDER_USDT  — лимит на одну сделку (например 300)
+TZ              — часовой пояс, по умолчанию Asia/Ho_Chi_Minh
 
-Примеры:
-/signal BUY SOL 25 @MKT TP=212 SL=188
-/signal BUY BTC 50 @LIM=59000 TP=60500 SL=57500
+Деплой:
+1) Залей файлы в GitHub.
+2) Railway -> New Project -> Deploy from GitHub.
+3) Добавь все переменные выше. Нажми Restart/Deploy.
+4) В Telegram: /start, /news, /market, /balance, /signal ...
