@@ -7,14 +7,14 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 # ========= ENV =========
-TG_TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("TG_TOKEN") or "").strip()
+TG_TOKEN  = (os.getenv("TELEGRAM_TOKEN") or os.getenv("TG_TOKEN") or "").strip()
 ALLOWED_ID = int(os.getenv("ALLOWED_USER_ID", "0"))
-API_KEY = os.getenv("MEXC_API_KEY", "").strip()
-SECRET  = os.getenv("MEXC_SECRET_KEY", "").strip()
-PAPER   = os.getenv("PAPER_MODE", "true").lower() == "true"
-MAX_USDT = float(os.getenv("MAX_ORDER_USDT", "300"))
-TZ = os.getenv("TZ", "Asia/Ho_Chi_Minh")
-BASE = "https://api.mexc.com"
+API_KEY   = os.getenv("MEXC_API_KEY", "").strip()
+SECRET    = os.getenv("MEXC_SECRET_KEY", "").strip()
+PAPER     = os.getenv("PAPER_MODE", "true").lower() == "true"
+MAX_USDT  = float(os.getenv("MAX_ORDER_USDT", "300"))
+TZ        = os.getenv("TZ", "Asia/Ho_Chi_Minh")
+BASE      = "https://api.mexc.com"
 
 if not TG_TOKEN or ":" not in TG_TOKEN:
     raise RuntimeError(f"Bad TELEGRAM_TOKEN: len={len(TG_TOKEN)}")
@@ -23,7 +23,9 @@ bot = Bot(token=TG_TOKEN, parse_mode="HTML")
 dp  = Dispatcher(bot)
 scheduler = AsyncIOScheduler(timezone=TZ)
 
-def ts(): return int(time.time()*1000)
+def ts() -> int:
+    return int(time.time() * 1000)
+
 def sign(query: str) -> str:
     return hmac.new(SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
@@ -74,7 +76,8 @@ def place_sl_stoplimit(symbol, qty, stop_px, lim_px):
 
 def pair(sym: str) -> str:
     sym = sym.upper()
-    if not sym.endswith("USDT"): sym += "USDT"
+    if not sym.endswith("USDT"):
+        sym += "USDT"
     return sym
 
 SIG_RE = re.compile(
@@ -82,7 +85,6 @@ SIG_RE = re.compile(
  re.IGNORECASE
 )
 
-# ====== News & Market (simple) ======
 NEWS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://www.investing.com/rss/market_overview.rss"
@@ -96,13 +98,13 @@ def fetch_url(url, timeout=15):
 
 def fetch_news(limit=6):
     items = []
-    import re
+    import re as _re
     for feed in NEWS:
         r = fetch_url(feed, timeout=15)
         if not r or r.status_code != 200: continue
-        titles = re.findall(r"<title>(.*?)</title>", r.text, re.I|re.S)
+        titles = _re.findall(r"<title>(.*?)</title>", r.text, _re.I|_re.S)
         for t in titles[1:10]:
-            t = re.sub("<.*?>", "", t).strip()
+            t = _re.sub("<.*?>", "", t).strip()
             if t and t not in items: items.append(t)
             if len(items)>=limit: break
         if len(items)>=limit: break
@@ -115,7 +117,6 @@ def binance_price(sym):
     try: return float(r.json().get("price",0))
     except: return None
 
-# ====== Bot Handlers ======
 def ensure_access(m: types.Message) -> bool:
     return m.from_user.id == ALLOWED_ID or ALLOWED_ID == 0
 
@@ -127,7 +128,7 @@ async def start(m: types.Message):
            "• /news — новости 📰\n"
            "• /market — цены BTC/ETH 📊\n"
            "• /balance — баланс на MEXC 💼\n"
-           "• /signal BUY SOL 25 @MKT TP=212 SL=188\\nR: Брейкаут 4h  — создать заявку с подтверждением ✅/❌\n"
+           "• /signal BUY SOL 25 @MKT TP=212 SL=188\nR: Брейкаут 4h  — заявка с подтверждением ✅/❌\n"
            f"PAPER_MODE={'ON' if PAPER else 'OFF'}")
     await m.answer(txt)
 
@@ -195,7 +196,6 @@ async def approve(c: types.CallbackQuery):
                                order_type=order_type, limit_price=lim if order_type=="LIMIT" else None)
         msg = f"✅ Ордер отправлен{' (PAPER)' if PAPER else ''}\n{side} {symbol} на {usdt} USDT\n"
         if side.upper()=="BUY":
-            # Оценим количество
             if "order" in res and "quantity" in res["order"]:
                 qty = float(res["order"]["quantity"])
             else:
@@ -221,10 +221,9 @@ async def cancel(c: types.CallbackQuery):
     await c.message.edit_reply_markup()
     await c.message.answer("Отменено.")
 
-# ===== Schedules =====
 def schedule_reports():
-    scheduler.add_job(lambda: asyncio.create_task(bot.send_message(ALLOWED_ID, "🌅 Утренний обзор доступен: /news, /market")), CronTrigger(hour=9, minute=0))
-    scheduler.add_job(lambda: asyncio.create_task(bot.send_message(ALLOWED_ID, "🌇 Вечерний обзор доступен: /news, /market")), CronTrigger(hour=20, minute=0))
+    scheduler.add_job(lambda: asyncio.create_task(bot.send_message(ALLOWED_ID, "🌅 Утренний обзор: /news, /market")), CronTrigger(hour=9, minute=0))
+    scheduler.add_job(lambda: asyncio.create_task(bot.send_message(ALLOWED_ID, "🌇 Вечерний обзор: /news, /market")), CronTrigger(hour=20, minute=0))
 
 if __name__ == "__main__":
     schedule_reports()
